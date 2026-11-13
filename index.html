@@ -297,8 +297,10 @@ function showInterstitial() { /* stub: no-op */ }
    =================================================================== */
 const Sfx = {
   ctx: null, master: null, noiseBuf: null,
+  /** Create/resume the context. Must run inside a real user-activation event
+   *  (touchend / pointerup / click) - mobile browsers ignore touch pointerdown. */
   init() {
-    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    if (this.ctx) { this.wake(); return; }
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     try {
@@ -308,9 +310,21 @@ const Sfx = {
       const len = this.ctx.sampleRate * 0.3, buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate), d = buf.getChannelData(0);
       for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
       this.noiseBuf = buf;
+      this.wake();
     } catch (e) { this.ctx = null; }
   },
-  ok() { return save.sound && this.ctx && this.ctx.state === 'running'; },
+  /** Resume from 'suspended' or iOS 'interrupted' (silent switch, calls, app switch)
+   *  and play a 1-sample silent buffer, which fully unlocks output on iOS. */
+  wake() {
+    const c = this.ctx; if (!c || c.state === 'closed') return;
+    if (c.state !== 'running') { try { c.resume(); } catch (e) {} }
+    try { const s = c.createBufferSource(); s.buffer = c.createBuffer(1, 1, 22050); s.connect(c.destination); s.start(0); } catch (e) {}
+  },
+  ok() {
+    if (!save.sound || !this.ctx) return false;
+    if (this.ctx.state !== 'running') { this.wake(); return false; }
+    return true;
+  },
   tone(f, dur, o = {}) {
     if (!this.ok()) return;
     const c = this.ctx, t = c.currentTime + (o.delay || 0);
@@ -345,7 +359,25 @@ const Sfx = {
   click() { this.tone(720, 0.05, { vol: 0.08, to: 520 }); },
   buy()   { this.coin(); [784, 988, 1175, 1568].forEach((f, i) => this.tone(f, 0.4, { vol: 0.1, delay: 0.12 + i * 0.08 })); this.noise(0.25, { vol: 0.04, freq: 3000, delay: 0.1 }); },
 };
-function buzz(p) { if (save.haptics && navigator.vibrate) { try { navigator.vibrate(p); } catch (e) {} } }
+/* Haptics: Android uses navigator.vibrate. iPhone Safari has no vibrate API, but
+   toggling a native <input type="checkbox" switch> (Safari 18+) fires a system haptic tick. */
+const hasVibrate = typeof navigator.vibrate === 'function';
+let iosSwitch = null, lastTick = 0;
+function iosTick() {
+  if (!iosSwitch) {
+    const lab = document.createElement('label'), inp = document.createElement('input');
+    inp.type = 'checkbox'; inp.setAttribute('switch', '');
+    lab.style.cssText = 'position:fixed;left:-100px;top:0;opacity:0;pointer-events:none';
+    lab.appendChild(inp); document.body.appendChild(lab); iosSwitch = lab;
+  }
+  const t = now(); if (t - lastTick < 60) return; lastTick = t;
+  try { iosSwitch.click(); } catch (e) {}
+}
+function buzz(p) {
+  if (!save.haptics) return;
+  if (hasVibrate) { try { navigator.vibrate(p); } catch (e) {} }
+  else iosTick();
+}
 
 /* ===================================================================
    6. LEVEL GENERATOR  (seeded random deal + solver = always solvable)
@@ -1432,7 +1464,10 @@ cv.addEventListener('pointerdown', e => {
   }
 });
 // Unlock audio on the first interaction anywhere (required by mobile browsers).
-document.addEventListener('pointerdown', () => Sfx.init(), true);
+// pointerdown starts it early on desktop; touchend/pointerup/click are the events
+// that count as user activation on phones, so every tap re-checks the context.
+['pointerdown', 'pointerup', 'touchend', 'click', 'keydown'].forEach(ev =>
+  document.addEventListener(ev, () => Sfx.init(), { capture: true, passive: true }));
 document.addEventListener('contextmenu', e => e.preventDefault());
 
 /* ===================================================================
@@ -1629,7 +1664,7 @@ function frame(t) {
 window.addEventListener('resize', measure);
 window.addEventListener('orientationchange', () => setTimeout(measure, 200));
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && Sfx.ctx) Sfx.ctx.suspend(); else if (Sfx.ctx) Sfx.ctx.resume();
+  if (document.hidden && Sfx.ctx) Sfx.ctx.suspend(); else Sfx.wake();
   lastT = now();
 });
 
