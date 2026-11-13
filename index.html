@@ -603,14 +603,20 @@ function winLevel() {
 /* ===================================================================
    8. LAYOUT  (screen metrics, safe areas, shelf grid)
    =================================================================== */
-const cv = $('cv'), ctx = cv.getContext('2d');
+const cv = $('cv'), ctx = cv.getContext('2d', { alpha: false });   // every screen paints a full background
+// Render caches (rebuilt on resize / layout change).
+const spriteCache = new Map();   // item type+size -> pre-drawn canvas
+const shelfCache = new Map();    // shelf variant+size -> pre-drawn canvas
+const sceneCache = { key: '', sky: null, front: null };   // title/shop static layers
 let W = 0, H = 0, dpr = 1;
 const safe = { t: 0, r: 0, b: 0, l: 0 };
 let Lay = null;        // shelf layout
 let bgPlay = null;     // cached interior background
 
 function measure() {
-  dpr = Math.min(3, window.devicePixelRatio || 1);
+  // Cap at 2x: phones like the Galaxy A54 report ~2.6, and the extra pixels cost a lot of fill-rate.
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  spriteCache.clear(); shelfCache.clear(); sceneCache.key = '';
   W = window.innerWidth; H = window.innerHeight;
   cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
   const cs = getComputedStyle($('probe'));
@@ -644,6 +650,7 @@ function layoutPlay() {
     for (let k = 0; k < inRow; k++) pos.push({ x: x0 + k * cellW + (cellW - w) / 2, y: y0 + row * rowH });
   }
   Lay = { w, h, cellW, slotH: w * RATIO_SLOT, base: w * RATIO_BASE, cap: w * RATIO_CAP, pos, item: w * 0.8 };
+  shelfCache.clear();
 }
 /** Centre of slot idx (0 = bottom) on shelf si. */
 function slotPos(si, idx) {
@@ -811,14 +818,28 @@ function drawItemShape(c, t) {
   }
 }
 /** Draw item at (x,y) with size s; sq = squash amount from landing bounce. */
+/** Item pre-rendered once per type and size (vector drawing every frame was the main lag source). */
+function itemSprite(t, base) {
+  const key = t + ':' + Math.round(base);
+  let k = spriteCache.get(key);
+  if (!k) {
+    const px = Math.ceil(base * 1.3 * dpr);           // 1.3x headroom covers lift/fly scaling
+    k = document.createElement('canvas'); k.width = k.height = px;
+    const c = k.getContext('2d');
+    c.scale(px / 120, px / 120); c.translate(60, 60); c.lineJoin = 'round';
+    drawItemShape(c, t);
+    spriteCache.set(key, k);
+  }
+  return k;
+}
 function drawItem(c, t, x, y, s, sq = 0, shadow = true) {
-  c.save(); c.translate(x, y);
-  if (shadow) { ell(c, 0, s * 0.42, s * 0.34, s * 0.07); c.fillStyle = 'rgba(40,20,5,.28)'; c.fill(); }
-  if (sq) { c.translate(0, s * 0.42); c.scale(1 + sq, 1 - sq); c.translate(0, -s * 0.42); }
-  c.scale(s / 100, s / 100);
-  c.lineJoin = 'round';
-  drawItemShape(c, t);
-  c.restore();
+  const spr = itemSprite(t, Lay ? Lay.item : s), half = s * 0.6;
+  if (shadow) { c.fillStyle = 'rgba(40,20,5,.28)'; ell(c, x, y + s * 0.42, s * 0.34, s * 0.07); c.fill(); }
+  if (sq) {
+    c.save(); c.translate(x, y + s * 0.42); c.scale(1 + sq, 1 - sq);
+    c.drawImage(spr, -half, -half - s * 0.42, half * 2, half * 2);
+    c.restore();
+  } else c.drawImage(spr, x - half, y - half, half * 2, half * 2);
 }
 
 /** Cozy interior wall behind shelves, cached per resize. */
@@ -863,20 +884,45 @@ function drawShelf(c, si, t) {
   if (sa < 0.4) ox = Math.sin(sa * 55) * w * 0.08 * (1 - sa / 0.4);
   const x = p.x + ox, y = p.y;
   const comp = G.done[si];
-  // floor shadow
-  ell(c, x + w / 2, y + h + 3, w * 0.55, w * 0.09); c.fillStyle = 'rgba(60,25,5,.25)'; c.fill();
-  // completion glow
+  // completion glow: pre-blurred sprite, pulsed with alpha (live shadowBlur is very slow on mobile)
   if (comp) {
     const age = (t - G.doneAt[si]) / 1000;
-    c.save();
-    c.shadowColor = 'rgba(255,214,100,.95)'; c.shadowBlur = w * 0.3 + Math.sin(t / 280) * w * 0.08 + Math.max(0, 1 - age) * w * 0.4;
-    rr(c, x - 2, y - 2, w + 4, h + 4, w * 0.16); c.fillStyle = 'rgba(255,220,120,.9)'; c.fill();
-    c.restore();
+    const g = shelfSprite('g');
+    c.globalAlpha = clamp(0.75 + Math.sin(t / 280) * 0.25 + Math.max(0, 1 - age) * 0.6, 0, 1);
+    c.drawImage(g.cv, x - g.pad, y - g.pad, g.cw, g.ch);
+    c.globalAlpha = 1;
   }
   // selected highlight
   if (G.sel === si) {
     rr(c, x - 4, y - 4, w + 8, h + 8, w * 0.18); c.fillStyle = 'rgba(255,246,220,.55)'; c.fill();
   }
+  const sp = shelfSprite(comp ? 'c' : 'n');
+  c.drawImage(sp.cv, x - sp.pad, y - sp.pad, sp.cw, sp.ch);
+  drawCheckBadge(c, si, x, y, t);
+}
+
+/** Pre-render a shelf variant: 'n' normal, 'c' complete, 'g' glow halo. */
+function shelfSprite(kind) {
+  const w = Lay.w, h = Lay.h, key = kind + ':' + w.toFixed(2);
+  let s = shelfCache.get(key);
+  if (s) return s;
+  const pad = Math.ceil(w * 0.7), cw = w + pad * 2, ch = h + pad * 2;
+  const cv2 = document.createElement('canvas');
+  cv2.width = Math.ceil(cw * dpr); cv2.height = Math.ceil(ch * dpr);
+  const c = cv2.getContext('2d'); c.scale(dpr, dpr); c.translate(pad, pad);
+  if (kind === 'g') {
+    c.shadowColor = 'rgba(255,214,100,.95)'; c.shadowBlur = w * 0.45 * dpr;
+    rr(c, -2, -2, w + 4, h + 4, w * 0.16); c.fillStyle = 'rgba(255,220,120,.9)'; c.fill(); c.fill();
+  } else drawShelfBody(c, 0, 0, kind === 'c');
+  s = { cv: cv2, pad, cw, ch };
+  shelfCache.set(key, s);
+  return s;
+}
+
+function drawShelfBody(c, x, y, comp) {
+  const w = Lay.w, h = Lay.h;
+  // floor shadow
+  ell(c, x + w / 2, y + h + 3, w * 0.55, w * 0.09); c.fillStyle = 'rgba(60,25,5,.25)'; c.fill();
   // body
   rr(c, x, y, w, h, w * 0.14); c.fillStyle = '#9a6038'; c.fill();
   rr(c, x + w * 0.09, y + Lay.cap, w * 0.82, h - Lay.cap - Lay.base * 0.6, w * 0.06);
@@ -894,8 +940,11 @@ function drawShelf(c, si, t) {
   circle(c, x + w / 2, y + Lay.cap * 0.5, w * 0.06); c.fillStyle = comp ? '#fff3c0' : '#8a5432'; c.fill();
   // outline
   rr(c, x, y, w, h, w * 0.14); c.strokeStyle = 'rgba(50,25,10,.55)'; c.lineWidth = Math.max(1.5, w * 0.03); c.stroke();
-  // check badge
-  if (comp) {
+}
+
+function drawCheckBadge(c, si, x, y, t) {
+  const w = Lay.w;
+  if (G.done[si]) {
     const age = clamp((t - G.doneAt[si]) / 450, 0, 1), s = easeOutBack(age) * w * 0.2;
     const bx = x + w / 2, by = y - w * 0.05;
     if (s > 0.5) {
@@ -957,11 +1006,6 @@ function drawSky(c, ground, t) {
   c.fillStyle = g; c.fillRect(0, 0, W, ground);
   circle(c, W * 0.16, ground * 0.3, 28); c.fillStyle = 'rgba(255,240,180,.9)'; c.fill();
   circle(c, W * 0.16, ground * 0.3, 44); c.fillStyle = 'rgba(255,240,180,.25)'; c.fill();
-  for (let k = 0; k < 3; k++) {
-    const x = ((t / 60000 + k * 0.37) % 1) * (W + 240) - 120, y = ground * (0.14 + k * 0.14);
-    c.fillStyle = 'rgba(255,255,255,.85)';
-    [[0, 0, 22], [22, -8, 26], [46, 0, 20], [24, 6, 22]].forEach(([dx, dy, r]) => { circle(c, x + dx, y + dy, r * 0.8); c.fill(); });
-  }
   ell(c, W * 0.15, ground + 8, W * 0.55, 50); c.fillStyle = '#b9d38a'; c.fill();
   ell(c, W * 0.9, ground + 12, W * 0.55, 62); c.fillStyle = '#a4c474'; c.fill();
   c.fillStyle = '#8fb565'; c.fillRect(0, ground - 6, W, 14);
@@ -972,18 +1016,50 @@ function drawSky(c, ground, t) {
   for (let i = 0; i < 30; i++) { ell(c, rnd() * W, ground + 14 + rnd() * (H - ground), 6 + rnd() * 10, 2 + rnd() * 2); c.fill(); }
 }
 
-function drawFacade(c, u, t) {
+/** Drifting clouds (drawn live over the cached sky). */
+function drawClouds(c, ground, t) {
+  c.fillStyle = 'rgba(255,255,255,.85)';
+  for (let k = 0; k < 3; k++) {
+    const x = ((t / 60000 + k * 0.37) % 1) * (W + 240) - 120, y = ground * (0.14 + k * 0.14);
+    [[0, 0, 22], [22, -8, 26], [46, 0, 20], [24, 6, 22]].forEach(([dx, dy, r]) => { circle(c, x + dx, y + dy, r * 0.8); c.fill(); });
+  }
+}
+
+/** Moving parts of the facade (smoke, lamp glow, cat, stork), drawn live over the cached facade. */
+function drawFacadeAnim(c, u, t) {
   const has = i => u > i;
-  const paint = has(3);
-  c.lineJoin = 'round'; c.lineCap = 'round';
-  // chimney + smoke
-  rr(c, 268, 30, 28, 60, 3); fillStroke(c, paint ? '#dcc6a8' : '#a99f92', '#6d5a48', 2.5);
-  rr(c, 264, 25, 36, 9, 2); fillStroke(c, '#8c6f57', '#5a4636', 2);
   if (!has(14)) for (let i = 0; i < 3; i++) {
     const p = ((t / 2600) + i / 3) % 1;
     c.globalAlpha = (1 - p) * 0.45; circle(c, 282 + Math.sin(p * 6 + i) * 5 + p * 18, 20 - p * 55, 5 + p * 10);
     c.fillStyle = '#fff'; c.fill(); c.globalAlpha = 1;
   }
+  if (has(7)) {
+    const fl = 0.85 + Math.sin(t / 130) * 0.05 + Math.sin(t / 47) * 0.04;
+    const gg = c.createRadialGradient(378, 190, 2, 378, 190, 46);
+    gg.addColorStop(0, `rgba(255,214,120,${0.5 * fl})`); gg.addColorStop(1, 'rgba(255,214,120,0)');
+    c.fillStyle = gg; circle(c, 378, 190, 46); c.fill();
+  }
+  if (has(13)) drawCat(c, 286, 281, t);
+  if (has(14)) {
+    c.save(); c.translate(0, Math.sin(t / 700) * 1.2); c.lineCap = 'round';
+    ell(c, 286, 10, 14, 8, -0.15); fillStroke(c, '#fbfbf6', '#9a9a90', 1.5);
+    ell(c, 294, 11, 9, 5, -0.2); c.fillStyle = '#222'; c.fill();
+    c.strokeStyle = '#fbfbf6'; c.lineWidth = 4.5; c.beginPath(); c.moveTo(278, 7); c.quadraticCurveTo(272, 0, 276, -6); c.stroke();
+    circle(c, 276, -7, 4); c.fillStyle = '#fbfbf6'; c.fill();
+    c.strokeStyle = '#e0702a'; c.lineWidth = 2.5; c.beginPath(); c.moveTo(273, -6); c.lineTo(262, -2); c.stroke();
+    circle(c, 276.5, -8, 1); c.fillStyle = '#222'; c.fill();
+    c.restore();
+  }
+}
+
+/** Static facade for upgrade level u (cached; see drawFacadeAnim for moving parts). */
+function drawFacade(c, u, t) {
+  const has = i => u > i;
+  const paint = has(3);
+  c.lineJoin = 'round'; c.lineCap = 'round';
+  // chimney
+  rr(c, 268, 30, 28, 60, 3); fillStroke(c, paint ? '#dcc6a8' : '#a99f92', '#6d5a48', 2.5);
+  rr(c, 264, 25, 36, 9, 2); fillStroke(c, '#8c6f57', '#5a4636', 2);
   // roof
   c.beginPath(); c.moveTo(28, 142); c.lineTo(86, 64); c.lineTo(314, 64); c.lineTo(372, 142); c.closePath();
   c.fillStyle = has(1) ? '#c95b3c' : '#99604f'; c.fill();
@@ -1100,8 +1176,6 @@ function drawFacade(c, u, t) {
       c.fillStyle = 'rgba(255,255,255,.4)'; circle(c, gx - 1, gy - 1, 1); c.fill();
     });
   }
-  // cat on the right windowsill
-  if (has(13)) drawCat(c, 286, 281, t);
   // bench
   if (has(8)) {
     c.fillStyle = '#7a4a2a';
@@ -1120,10 +1194,6 @@ function drawFacade(c, u, t) {
   }
   // street lamp
   if (has(7)) {
-    const fl = 0.85 + Math.sin(t / 130) * 0.05 + Math.sin(t / 47) * 0.04;
-    const gg = c.createRadialGradient(378, 190, 2, 378, 190, 46);
-    gg.addColorStop(0, `rgba(255,214,120,${0.55 * fl})`); gg.addColorStop(1, 'rgba(255,214,120,0)');
-    c.fillStyle = gg; circle(c, 378, 190, 46); c.fill();
     c.fillStyle = '#3a3430'; c.fillRect(375, 200, 6, 122); rr(c, 369, 316, 18, 7, 2); c.fill();
     c.beginPath(); c.moveTo(368, 180); c.lineTo(378, 172); c.lineTo(388, 180); c.closePath(); c.fill();
     rr(c, 370, 180, 16, 20, 2); fillStroke(c, '#ffd36b', '#3a3430', 2.5);
@@ -1142,18 +1212,9 @@ function drawFacade(c, u, t) {
   }
   // stork nest
   if (has(14)) {
-    const bob = Math.sin(t / 700) * 1.2;
     ell(c, 282, 22, 22, 8); fillStroke(c, '#8a5a30', '#5a3a1a', 2);
     c.strokeStyle = '#b07a48'; c.lineWidth = 1.5;
     for (let i = -3; i <= 3; i++) { c.beginPath(); c.moveTo(262 + (i + 3) * 6, 18); c.lineTo(268 + (i + 3) * 5, 27); c.stroke(); }
-    c.save(); c.translate(0, bob);
-    ell(c, 286, 10, 14, 8, -0.15); fillStroke(c, '#fbfbf6', '#9a9a90', 1.5);
-    ell(c, 294, 11, 9, 5, -0.2); c.fillStyle = '#222'; c.fill();
-    c.strokeStyle = '#fbfbf6'; c.lineWidth = 4.5; c.beginPath(); c.moveTo(278, 7); c.quadraticCurveTo(272, 0, 276, -6); c.stroke();
-    circle(c, 276, -7, 4); c.fillStyle = '#fbfbf6'; c.fill();
-    c.strokeStyle = '#e0702a'; c.lineWidth = 2.5; c.beginPath(); c.moveTo(273, -6); c.lineTo(262, -2); c.stroke();
-    circle(c, 276.5, -8, 1); c.fillStyle = '#222'; c.fill();
-    c.restore();
   }
 }
 
@@ -1363,8 +1424,6 @@ function drawCabinet(c, t) {
       const gg = c.createRadialGradient(cx, cy, 4, cx, cy, 40); gg.addColorStop(0, 'rgba(255,220,140,.35)'); gg.addColorStop(1, 'rgba(255,220,140,0)');
       c.fillStyle = gg; circle(c, cx, cy, 40); c.fill();
       drawHeirloom(c, i, cx, cy, 60);
-      const tw = (Math.sin(t / 400 + i * 1.7) + 1) / 2;
-      if (tw > 0.85) drawStar(c, cx + 20, cy - 22, 5 * (tw - 0.85) / 0.15, '#fff6c8');
     } else {
       c.globalAlpha = 0.13; drawHeirloom(c, i, cx, cy, 56); c.globalAlpha = 1;
       c.fillStyle = 'rgba(255,240,210,.35)'; c.font = 'bold 22px Georgia, serif'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText('?', cx, cy);
@@ -1429,18 +1488,49 @@ function drawParts(c) {
 
 /* ---------- Per-screen render ---------- */
 let shopTab = 'up';
+/** (Re)build the static sky + facade/cabinet layers only when something they show changes. */
+function buildScene(f, heir) {
+  const key = [screen, heir, W, H, dpr, f.sc.toFixed(3), save.upg, save.heir.length].join('|');
+  if (sceneCache.key === key) return;
+  sceneCache.key = key;
+  if (!heir) {
+    const s = sceneCache.sky || document.createElement('canvas');
+    s.width = Math.round(W * dpr); s.height = Math.round(H * dpr);
+    const c = s.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0); drawSky(c, f.ground, 0);
+    sceneCache.sky = s;
+  }
+  const top = -24, bot = 350;
+  const fr = sceneCache.front || document.createElement('canvas');
+  fr.width = Math.ceil(400 * f.sc * dpr); fr.height = Math.ceil((bot - top) * f.sc * dpr);
+  const c = fr.getContext('2d');
+  c.setTransform(f.sc * dpr, 0, 0, f.sc * dpr, 0, -top * f.sc * dpr);
+  c.clearRect(0, top, 400, bot - top);
+  if (heir) drawCabinet(c, 0); else drawFacade(c, save.upg, 0);
+  sceneCache.front = fr;
+  sceneCache.fx = f.x; sceneCache.fy = f.y + top * f.sc; sceneCache.fw = 400 * f.sc; sceneCache.fh = (bot - top) * f.sc;
+}
+function drawCabinetTwinkles(c, t) {
+  save.heir.forEach(i => {
+    const r = Math.floor(i / 4), col = i % 4, cx = 52 + 37 + col * 74, cy = 46 + r * 90 + 44;
+    const tw = (Math.sin(t / 400 + i * 1.7) + 1) / 2;
+    if (tw > 0.85) drawStar(c, cx + 20, cy - 22, 5 * (tw - 0.85) / 0.15, '#fff6c8');
+  });
+}
 function render(t) {
   const c = ctx;
   c.setTransform(dpr, 0, 0, dpr, 0, 0);
   if (screen === 'play') renderPlay(c, t);
   else {
-    const f = facadeRect();
-    if (screen === 'shop' && shopTab === 'heir') {
-      if (bgPlay) c.drawImage(bgPlay, 0, 0, W, H);
-      c.save(); c.translate(f.x, f.y); c.scale(f.sc, f.sc); drawCabinet(c, t); c.restore();
-    } else {
-      drawSky(c, f.ground, t);
-      c.save(); c.translate(f.x, f.y); c.scale(f.sc, f.sc); drawFacade(c, save.upg, t); c.restore();
+    const f = facadeRect(), heir = screen === 'shop' && shopTab === 'heir';
+    buildScene(f, heir);
+    const S = sceneCache;
+    if (heir) { if (bgPlay) c.drawImage(bgPlay, 0, 0, W, H); }
+    else { c.drawImage(S.sky, 0, 0, W, H); drawClouds(c, f.ground, t); }
+    c.drawImage(S.front, S.fx, S.fy, S.fw, S.fh);
+    c.save(); c.translate(f.x, f.y); c.scale(f.sc, f.sc);
+    if (heir) drawCabinetTwinkles(c, t); else drawFacadeAnim(c, save.upg, t);
+    c.restore();
+    {
       if (screen === 'title') {
         const g = c.createLinearGradient(0, 0, 0, H * 0.3); g.addColorStop(0, 'rgba(255,240,210,.55)'); g.addColorStop(1, 'rgba(255,240,210,0)');
         c.fillStyle = g; c.fillRect(0, 0, W, H * 0.3);
