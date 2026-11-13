@@ -595,7 +595,7 @@ function winLevel() {
   }
   save.coins += total; save.level = L + 1; persist();
   G.reward = { total, bonus, hardBonus, heir };
-  confetti(110);
+  confetti(80);
   Sfx.jingle(); buzz([30, 50, 30, 50, 80]);
   setTimeout(() => showComplete(), 1150);
 }
@@ -906,12 +906,13 @@ function shelfSprite(kind) {
   const w = Lay.w, h = Lay.h, key = kind + ':' + w.toFixed(2);
   let s = shelfCache.get(key);
   if (s) return s;
-  const pad = Math.ceil(w * 0.7), cw = w + pad * 2, ch = h + pad * 2;
+  // Tight padding: on a win every shelf glows at once, so sprite area = GPU overdraw.
+  const pad = Math.ceil(kind === 'g' ? w * 0.42 : w * 0.12), cw = w + pad * 2, ch = h + pad * 2;
   const cv2 = document.createElement('canvas');
   cv2.width = Math.ceil(cw * dpr); cv2.height = Math.ceil(ch * dpr);
   const c = cv2.getContext('2d'); c.scale(dpr, dpr); c.translate(pad, pad);
   if (kind === 'g') {
-    c.shadowColor = 'rgba(255,214,100,.95)'; c.shadowBlur = w * 0.45 * dpr;
+    c.shadowColor = 'rgba(255,214,100,.95)'; c.shadowBlur = w * 0.3 * dpr;
     rr(c, -2, -2, w + 4, h + 4, w * 0.16); c.fillStyle = 'rgba(255,220,120,.9)'; c.fill(); c.fill();
   } else drawShelfBody(c, 0, 0, kind === 'c');
   s = { cv: cv2, pad, cw, ch };
@@ -1466,23 +1467,57 @@ function confetti(n) {
   }
 }
 function updateParts(dt) {
-  for (let i = parts.length - 1; i >= 0; i--) {
+  let n = 0;
+  for (let i = 0; i < parts.length; i++) {
     const p = parts[i]; p.life += dt;
-    if (p.life > p.max) { parts.splice(i, 1); continue; }
+    // drop dead particles and confetti that has fallen off-screen
+    if (p.life > p.max || (p.kind === 'conf' && p.vy > 0 && p.y > H + 20)) continue;
     if (p.kind === 'conf') { p.vy += 620 * dt; p.vx *= 1 - 1.2 * dt; p.vy *= 1 - 0.6 * dt; }
     else { p.vy += 160 * dt; p.vx *= 1 - 3 * dt; p.vy *= 1 - 3 * dt; }
     p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
+    parts[n++] = p;
   }
+  parts.length = n;
+}
+/** Particles are batched: one path + one fill() per colour/alpha group, with corners
+ *  computed by hand. Per-particle save/rotate/fill/restore made confetti drop frames on phones. */
+// Integer group keys (colour index * 5 + alpha step) so drawing allocates nothing per frame;
+// garbage-collection pauses are another source of dropped frames on phones.
+const partColors = [], partColorIdx = new Map(), partGroups = [];
+function colorIndex(col) {
+  let i = partColorIdx.get(col);
+  if (i === undefined) { i = partColors.length; partColors.push(col); partColorIdx.set(col, i); for (let k = 0; k < 5; k++) partGroups.push([]); }
+  return i;
 }
 function drawParts(c) {
-  parts.forEach(p => {
-    const a = 1 - p.life / p.max;
-    c.globalAlpha = clamp(a * 1.5, 0, 1);
-    if (p.kind === 'conf') {
-      c.save(); c.translate(p.x, p.y); c.rotate(p.rot); c.scale(1, Math.abs(Math.cos(p.rot * 1.3)) * 0.8 + 0.2);
-      c.fillStyle = p.col; c.fillRect(-p.size / 2, -p.size / 4, p.size, p.size / 2); c.restore();
-    } else drawStar(c, p.x, p.y, p.size * (0.5 + a), p.col);
-  });
+  if (!parts.length) return;
+  for (let i = 0; i < partGroups.length; i++) partGroups[i].length = 0;
+  for (const p of parts) {
+    if (p.x < -30 || p.x > W + 30 || p.y < -30 || p.y > H + 30) continue;
+    const a = clamp((1 - p.life / p.max) * 1.5, 0, 1);
+    if (p.ci === undefined) p.ci = colorIndex(p.col);
+    partGroups[p.ci * 5 + Math.ceil(a * 4)].push(p);      // 4 alpha steps keep group count tiny
+  }
+  for (let gi = 0; gi < partGroups.length; gi++) {
+    const g = partGroups[gi], step = gi % 5;
+    if (!g.length || !step) continue;
+    c.globalAlpha = step / 4; c.fillStyle = partColors[(gi / 5) | 0]; c.beginPath();
+    for (const p of g) {
+      if (p.kind === 'conf') {
+        const cs = Math.cos(p.rot), sn = Math.sin(p.rot);
+        const hw = p.size / 2, hh = p.size / 4 * (Math.abs(Math.cos(p.rot * 1.3)) * 0.8 + 0.2);
+        const ax = cs * hw, ay = sn * hw, bx = -sn * hh, by = cs * hh;
+        c.moveTo(p.x - ax - bx, p.y - ay - by); c.lineTo(p.x + ax - bx, p.y + ay - by);
+        c.lineTo(p.x + ax + bx, p.y + ay + by); c.lineTo(p.x - ax + bx, p.y - ay + by); c.closePath();
+      } else {
+        const r = p.size * (0.5 + (1 - p.life / p.max));
+        c.moveTo(p.x + r, p.y); c.lineTo(p.x + r * 0.25, p.y + r * 0.25); c.lineTo(p.x, p.y + r);
+        c.lineTo(p.x - r * 0.25, p.y + r * 0.25); c.lineTo(p.x - r, p.y); c.lineTo(p.x - r * 0.25, p.y - r * 0.25);
+        c.lineTo(p.x, p.y - r); c.lineTo(p.x + r * 0.25, p.y - r * 0.25); c.closePath();
+      }
+    }
+    c.fill();
+  }
   c.globalAlpha = 1;
 }
 
@@ -1686,7 +1721,7 @@ function buyUpgrade(i) {
   burst(x, y, 36, ['#fff6c8', '#ffd46b', '#ffffff', '#f4b942', '#c8473a'], 'spark');
   Sfx.buy(); buzz([15, 30, 25]);
   updateCoins(true); buildShop();
-  if (save.upg === UPGRADES.length) setTimeout(() => { confetti(120); Sfx.jingle(); toast('Prăvălia is fully restored! Bravo!', 3000); }, 500);
+  if (save.upg === UPGRADES.length) setTimeout(() => { confetti(90); Sfx.jingle(); toast('Prăvălia is fully restored! Bravo!', 3000); }, 500);
   else toast(u.name + ' - done!');
 }
 
